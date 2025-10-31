@@ -1,3 +1,4 @@
 telethon
 jinja2
 beautifulsoup4
+python-dotenv

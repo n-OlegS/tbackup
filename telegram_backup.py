@@ -8,6 +8,7 @@ import warnings
 import csv
 import hashlib
 import datetime
+from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
 from telethon.tl.types import User, Channel, Chat, ChannelForbidden, MessageMediaWebPage
 from jinja2 import Environment, FileSystemLoader
@@ -16,8 +17,21 @@ from telethon.tl.functions.contacts import GetContactsRequest
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
-api_id = 12345678
-api_hash = "abcdef1234567890abcdef1234567890"
+# Load environment variables from .env file
+load_dotenv()
+
+# Get API credentials from environment variables
+api_id = int(os.getenv('TELEGRAM_API_ID', 0))
+api_hash = os.getenv('TELEGRAM_API_HASH', '')
+
+# Validate API credentials
+if not api_id or not api_hash:
+    print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in your .env file")
+    print("Get your credentials from https://my.telegram.org")
+    print("Create a .env file with:")
+    print("TELEGRAM_API_ID=your_api_id")
+    print("TELEGRAM_API_HASH=your_api_hash")
+    exit(1)
 
 def get_url_from_forwarded(forwarded):
     if forwarded is None:
