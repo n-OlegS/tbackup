@@ -24,6 +24,9 @@ load_dotenv()
 api_id = int(os.getenv('TELEGRAM_API_ID', 0))
 api_hash = os.getenv('TELEGRAM_API_HASH', '')
 
+# Get output folder from environment variables
+output_folder = os.getenv('OUTPUT_FOLDER', 'telegram_backups')
+
 # Validate API credentials
 if not api_id or not api_hash:
     print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in your .env file")
@@ -31,7 +34,11 @@ if not api_id or not api_hash:
     print("Create a .env file with:")
     print("TELEGRAM_API_ID=your_api_id")
     print("TELEGRAM_API_HASH=your_api_hash")
+    print("OUTPUT_FOLDER=telegram_backups")
     exit(1)
+
+# Create output folder if it doesn't exist
+os.makedirs(output_folder, exist_ok=True)
 
 def get_url_from_forwarded(forwarded):
     if forwarded is None:
@@ -79,7 +86,7 @@ def extract_user_id(from_id_str):
 async def get_contacts(client, phone_number):
     print("Extracting contacts list...")
     
-    contacts_filename = f"contacts_{phone_number}.csv"
+    contacts_filename = os.path.join(output_folder, f"contacts_{phone_number}.csv")
     
     try:
         result = await client(GetContactsRequest(hash=0))
@@ -222,7 +229,7 @@ async def main():
         
         entities[entity_type].append((entity.id, name, entity))
 
-    entities_filename = f"entities_{phone_number}.csv"
+    entities_filename = os.path.join(output_folder, f"entities_{phone_number}.csv")
     
     with open(entities_filename, "w", encoding="utf-8-sig", newline='') as csvfile:
         csv_writer = csv.writer(csvfile)
@@ -373,7 +380,7 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
         return
 
     sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
-    db_name = f"{sanitized_name}.db"
+    db_name = os.path.join(output_folder, f"{sanitized_name}.db")
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
     
@@ -532,8 +539,9 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
                 if download_media:
                     if not await media_exists(cursor, entity_id, id, media_type):
                         try:
-                            os.makedirs(f"media/{entity_id}", exist_ok=True)
-                            media_file = await message.download_media(file=f"media/{entity_id}")
+                            media_dir = os.path.join(output_folder, "media", str(entity_id))
+                            os.makedirs(media_dir, exist_ok=True)
+                            media_file = await message.download_media(file=media_dir)
                             if media_file:
                                 media_hash = get_file_hash(media_file)
                         except Exception as e:
@@ -644,7 +652,7 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
     print(f"\nUpdating: {entity_name} (ID: {entity_id})")
     
     sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
-    db_name = f"{sanitized_name}.db"
+    db_name = os.path.join(output_folder, f"{sanitized_name}.db")
     
     if not os.path.exists(db_name):
         print(f"No existing database found for {entity_name}. Creating new backup...")
@@ -824,7 +832,9 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
                 if download_media:
                     if not await media_exists(cursor, entity_id, id, media_type):
                         try:
-                            media_file = await message.download_media(file=f"media/{entity_id}/")
+                            media_dir = os.path.join(output_folder, "media", str(entity_id))
+                            os.makedirs(media_dir, exist_ok=True)
+                            media_file = await message.download_media(file=media_dir)
                             if media_file:
                                 media_hash = get_file_hash(media_file)
                         except Exception as e:
@@ -981,10 +991,24 @@ def generate_html(db_name, chat_name, entity_id=None):
             
         return f"{sender}: {text}"
     
+    # Function to convert absolute media paths to relative paths
+    def get_relative_media_path(media_file):
+        if not media_file:
+            return None
+        # Convert absolute path to relative path from HTML file location
+        return os.path.relpath(media_file, output_folder)
+    
     if entity_id is not None:
         date_groups = {}
         
         for message in messages:
+            # Convert message tuple to list so we can modify the media path
+            message_list = list(message)
+            # Update media path to relative path (index 4 is media_file)
+            if message_list[4]:
+                message_list[4] = get_relative_media_path(message_list[4])
+            message = tuple(message_list)
+            
             date_str = message[1]
             if date_str and 'T' in date_str:
                 try:
@@ -1007,6 +1031,13 @@ def generate_html(db_name, chat_name, entity_id=None):
     else:
         grouped_messages = []
         for message in messages:
+            # Convert message tuple to list so we can modify the media path
+            message_list = list(message)
+            # Update media path to relative path (index 4 is media_file)
+            if message_list[4]:
+                message_list[4] = get_relative_media_path(message_list[4])
+            message = tuple(message_list)
+            
             date_str = message[1]
             if date_str and 'T' in date_str:
                 day_str = date_str.split('T')[0]
@@ -1030,10 +1061,11 @@ def generate_html(db_name, chat_name, entity_id=None):
         get_reply_preview=get_reply_preview
     )
     
-    with open(f"{chat_name}.html", "w", encoding='utf-8') as f:
+    html_filename = os.path.join(output_folder, f"{chat_name}.html")
+    with open(html_filename, "w", encoding='utf-8') as f:
         f.write(output)
     
-    print(f"HTML file generated: {chat_name}.html")
+    print(f"HTML file generated: {html_filename}")
 
 if __name__ == "__main__":
     asyncio.run(main())
