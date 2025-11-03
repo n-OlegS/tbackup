@@ -27,6 +27,10 @@ api_hash = os.getenv('TELEGRAM_API_HASH', '')
 # Get output folder from environment variables
 output_folder = os.getenv('OUTPUT_FOLDER', 'telegram_backups')
 
+# Check if output folder is on network storage and use local temp if needed
+use_local_temp = os.getenv('USE_LOCAL_TEMP', 'false').lower() == 'true'
+local_temp_folder = os.getenv('LOCAL_TEMP_FOLDER', '/tmp/telegram_backups')
+
 # Validate API credentials
 if not api_id or not api_hash:
     print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in your .env file")
@@ -90,18 +94,14 @@ async def get_db_connection(db_name, max_retries=5):
             
             conn = sqlite3.connect(db_name, timeout=60.0)
             
-            # Try to enable WAL mode, but fall back to DELETE mode if it fails
-            try:
-                result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-                if result and result[0].upper() != 'WAL':
-                    print("WAL mode not available, using DELETE mode")
-                    conn.execute("PRAGMA journal_mode=DELETE")
-            except sqlite3.OperationalError:
-                print("Failed to set WAL mode, using default")
-                
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA temp_store=memory")
-            conn.execute("PRAGMA busy_timeout=60000")  # 60 second busy timeout
+            # NAS-optimized SQLite settings
+            conn.execute("PRAGMA journal_mode=DELETE")  # Better for network storage
+            conn.execute("PRAGMA synchronous=OFF")  # Reduce network I/O (trade safety for speed)
+            conn.execute("PRAGMA temp_store=MEMORY")  # Keep temp data in RAM
+            conn.execute("PRAGMA busy_timeout=120000")  # 2 minute timeout for network latency
+            conn.execute("PRAGMA locking_mode=NORMAL")  # Normal locking mode
+            conn.execute("PRAGMA cache_size=-64000")  # 64MB cache to reduce network calls
+            conn.execute("PRAGMA page_size=4096")  # Larger pages for network efficiency
             
             # Test the connection
             conn.execute("SELECT 1").fetchone()
@@ -150,18 +150,14 @@ def get_db_connection_sync(db_name, max_retries=5):
             
             conn = sqlite3.connect(db_name, timeout=60.0)
             
-            # Try to enable WAL mode, but fall back to DELETE mode if it fails
-            try:
-                result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-                if result and result[0].upper() != 'WAL':
-                    print("WAL mode not available, using DELETE mode")
-                    conn.execute("PRAGMA journal_mode=DELETE")
-            except sqlite3.OperationalError:
-                print("Failed to set WAL mode, using default")
-                
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA temp_store=memory")
-            conn.execute("PRAGMA busy_timeout=60000")  # 60 second busy timeout
+            # NAS-optimized SQLite settings
+            conn.execute("PRAGMA journal_mode=DELETE")  # Better for network storage
+            conn.execute("PRAGMA synchronous=OFF")  # Reduce network I/O (trade safety for speed)
+            conn.execute("PRAGMA temp_store=MEMORY")  # Keep temp data in RAM
+            conn.execute("PRAGMA busy_timeout=120000")  # 2 minute timeout for network latency
+            conn.execute("PRAGMA locking_mode=NORMAL")  # Normal locking mode
+            conn.execute("PRAGMA cache_size=-64000")  # 64MB cache to reduce network calls
+            conn.execute("PRAGMA page_size=4096")  # Larger pages for network efficiency
             
             # Test the connection
             conn.execute("SELECT 1").fetchone()
@@ -195,6 +191,103 @@ def cleanup_database_files(db_name):
                 print(f"Cleaned up: {file_path}")
             except Exception as e:
                 print(f"Could not remove {file_path}: {e}")
+
+async def execute_with_retry(cursor, query, params=None, max_retries=3):
+    """Execute a database query with retry logic for locked databases."""
+    for attempt in range(max_retries):
+        try:
+            if params:
+                return cursor.execute(query, params)
+            else:
+                return cursor.execute(query)
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)
+                print(f"Database locked during query execution (attempt {attempt + 1}/{max_retries}). Waiting {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                raise
+
+def execute_with_retry_sync(cursor, query, params=None, max_retries=3):
+    """Execute a database query with retry logic for locked databases (synchronous version)."""
+    import time
+    for attempt in range(max_retries):
+        try:
+            if params:
+                return cursor.execute(query, params)
+            else:
+                return cursor.execute(query)
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)
+                print(f"Database locked during query execution (attempt {attempt + 1}/{max_retries}). Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+            else:
+                raise
+
+class DatabaseRetryContext:
+    """Context manager for database operations with retry logic."""
+    def __init__(self, conn, cursor, max_retries=3):
+        self.conn = conn
+        self.cursor = cursor
+        self.max_retries = max_retries
+        self.operations = []
+    
+    async def execute(self, query, params=None):
+        """Queue a database operation to be executed."""
+        self.operations.append((query, params))
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Execute all queued operations with retry logic."""
+        for attempt in range(self.max_retries):
+            try:
+                for query, params in self.operations:
+                    if params:
+                        self.cursor.execute(query, params)
+                    else:
+                        self.cursor.execute(query)
+                self.conn.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < self.max_retries - 1:
+                    wait_time = 5 * (attempt + 1)
+                    print(f"Database locked during batch execution (attempt {attempt + 1}/{self.max_retries}). Waiting {wait_time} seconds...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    raise
+        return False
+
+def get_working_db_path(final_db_path):
+    """Get the working database path - either local temp or final location."""
+    if use_local_temp:
+        # Create local temp directory if it doesn't exist
+        os.makedirs(local_temp_folder, exist_ok=True)
+        # Use the same filename but in local temp folder
+        filename = os.path.basename(final_db_path)
+        return os.path.join(local_temp_folder, filename)
+    else:
+        return final_db_path
+
+def copy_to_final_location(temp_db_path, final_db_path):
+    """Copy database from temp location to final location."""
+    if use_local_temp and temp_db_path != final_db_path:
+        import shutil
+        print(f"Copying database from {temp_db_path} to {final_db_path}...")
+        # Ensure final directory exists
+        os.makedirs(os.path.dirname(final_db_path), exist_ok=True)
+        shutil.copy2(temp_db_path, final_db_path)
+        # Clean up temp file
+        try:
+            os.remove(temp_db_path)
+        except:
+            pass
+        print("Database copied successfully.")
 
 def extract_user_id(from_id_str):
     if not from_id_str:
@@ -514,16 +607,17 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
         return
 
     sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
-    db_name = os.path.join(output_folder, f"{sanitized_name}.db")
+    final_db_path = os.path.join(output_folder, f"{sanitized_name}.db")
+    working_db_path = get_working_db_path(final_db_path)
     
     # Clean up any problematic auxiliary files first
-    cleanup_database_files(db_name)
+    cleanup_database_files(working_db_path)
     
     # Get database connection with retry logic
-    conn = await get_db_connection(db_name)
+    conn = await get_db_connection(working_db_path)
     cursor = conn.cursor()
     
-    cursor.execute("""
+    await execute_with_retry(cursor, """
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER,
         entity_id INTEGER,
@@ -547,7 +641,7 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
         PRIMARY KEY (id, entity_id)
     )""")
     
-    cursor.execute("""
+    await execute_with_retry(cursor, """
     CREATE TABLE IF NOT EXISTS buttons (
         message_id INTEGER,
         entity_id INTEGER,
@@ -559,7 +653,7 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
         UNIQUE(message_id, entity_id, row, column)
     )""")
     
-    cursor.execute("""
+    await execute_with_retry(cursor, """
     CREATE TABLE IF NOT EXISTS replies (
         message_id INTEGER,
         entity_id INTEGER,
@@ -568,7 +662,7 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
         UNIQUE(message_id, entity_id)
     )""")
     
-    cursor.execute("""
+    await execute_with_retry(cursor, """
     CREATE TABLE IF NOT EXISTS reactions (
         message_id INTEGER,
         entity_id INTEGER,
@@ -784,25 +878,36 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
         print(f"Cannot access entity {entity_name} (ID: {entity_id}). It may be private or you may have been banned.")
     finally:
         conn.close()
+        # Copy database to final location if using local temp
+        copy_to_final_location(working_db_path, final_db_path)
     
-    generate_html(db_name, sanitized_name, entity_id)
+    generate_html(final_db_path, sanitized_name, entity_id)
 
 async def update_entity(client, entity_id, entity_name, entity, download_media=False):
     print(f"\nUpdating: {entity_name} (ID: {entity_id})")
     
     sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
-    db_name = os.path.join(output_folder, f"{sanitized_name}.db")
+    final_db_path = os.path.join(output_folder, f"{sanitized_name}.db")
     
-    if not os.path.exists(db_name):
+    if not os.path.exists(final_db_path):
         print(f"No existing database found for {entity_name}. Creating new backup...")
         await process_entity(client, entity_id, entity_name, entity, download_media=download_media)
         return
     
+    working_db_path = get_working_db_path(final_db_path)
+    
+    # If using local temp, copy existing database to temp location first
+    if use_local_temp and working_db_path != final_db_path:
+        import shutil
+        print(f"Copying existing database to temp location for processing...")
+        os.makedirs(local_temp_folder, exist_ok=True)
+        shutil.copy2(final_db_path, working_db_path)
+    
     # Clean up any problematic auxiliary files first
-    cleanup_database_files(db_name)
+    cleanup_database_files(working_db_path)
     
     # Get database connection with retry logic
-    conn = await get_db_connection(db_name)
+    conn = await get_db_connection(working_db_path)
     cursor = conn.cursor()
     
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
@@ -1072,8 +1177,10 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
         print(f"Error updating messages: {e}")
     finally:
         conn.close()
+        # Copy database to final location if using local temp
+        copy_to_final_location(working_db_path, final_db_path)
     
-    generate_html(db_name, sanitized_name, entity_id)
+    generate_html(final_db_path, sanitized_name, entity_id)
 
 def generate_html(db_name, chat_name, entity_id=None):
     # Clean up any problematic auxiliary files first
