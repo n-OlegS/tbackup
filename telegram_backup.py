@@ -623,6 +623,201 @@ async def get_channel_name_from_message(client, message):
         print(f"Error getting channel name: {str(e)}")
     return None
 
+async def process_message(client, message, cursor, entity_id, extraction_time, download_media=False):
+    """Process a single message and insert it into the database."""
+    message_dict = message.to_dict()
+    id = message_dict["id"]
+    date = message_dict["date"].isoformat()
+    text = message_dict.get("message", None)
+    media_type = None
+    media_file = None
+    media_hash = None
+    is_service_message = False
+    is_voice_message = False
+    is_pinned = message.pinned
+    
+    if hasattr(message, 'action') and message.action:
+        action_dict = message.action.to_dict()
+        action_type = action_dict["_"]
+        
+        if action_type == "MessageActionChatAddUser":
+            user_ids = action_dict.get("users", [])
+            user_names = []
+            for user_id in user_ids:
+                try:
+                    user = await client.get_entity(user_id)
+                    if hasattr(user, "first_name") and user.first_name:
+                        name = user.first_name
+                        if hasattr(user, "last_name") and user.last_name:
+                            name += f" {user.last_name}"
+                    else:
+                        name = f"User {user_id}"
+                    user_names.append(name)
+                except Exception as e:
+                    print(f"Error getting user {user_id}: {str(e)}")
+                    user_names.append(f"User {user_id}")
+            text = f"<service>{', '.join(filter(None, user_names))} joined the group</service>"
+            is_service_message = True
+        elif action_type == "MessageActionChatDeleteUser":
+            user_id = action_dict.get("user_id")
+            try:
+                user = await client.get_entity(user_id)
+                if hasattr(user, "first_name") and user.first_name:
+                    name = user.first_name
+                    if hasattr(user, "last_name") and user.last_name:
+                        name += f" {user.last_name}"
+                else:
+                    name = f"User {user_id}"
+            except Exception as e:
+                print(f"Error getting user {user_id}: {str(e)}")
+                name = f"User {user_id}"
+            text = f"<service>{name} left the group</service>"
+            is_service_message = True
+        elif action_type == "MessageActionChatJoinedByLink":
+            try:
+                if message.sender:
+                    user_name = message.sender.first_name
+                    if hasattr(message.sender, "last_name") and message.sender.last_name:
+                        user_name += f" {message.sender.last_name}"
+                else:
+                    user_name = "Someone"
+            except:
+                user_name = "Someone"
+            text = f"<service>{user_name} joined the group via invite link</service>"
+            is_service_message = True
+        elif action_type == "MessageActionChannelCreate":
+            title = action_dict.get("title", "this channel")
+            text = f"<service>Channel {title} created</service>"
+            is_service_message = True
+        elif action_type == "MessageActionChatCreate":
+            title = action_dict.get("title", "this group")
+            text = f"<service>Group {title} created</service>"
+            is_service_message = True
+        elif action_type == "MessageActionGroupCall":
+            if action_dict.get("duration"):
+                text = f"<service>Group call ended</service>"
+            else:
+                text = f"<service>Group call started</service>"
+            is_service_message = True
+        elif action_type == "MessageActionChatEditTitle":
+            title = action_dict.get("title", "")
+            text = f"<service>Group name changed to: {title}</service>"
+            is_service_message = True
+        else:
+            text = f"<service>Service message: {action_type}</service>"
+            is_service_message = True
+    
+    web_preview = await get_web_preview_data(message)
+    
+    if message.media:
+        media_type = message_dict["media"]["_"]
+        
+        if media_type == "MessageMediaDocument":
+            if hasattr(message.media, "document") and hasattr(message.media.document, "attributes"):
+                for attr in message.media.document.attributes:
+                    if hasattr(attr, "_") and attr._ == "DocumentAttributeAudio":
+                        if hasattr(attr, "voice") and attr.voice:
+                            is_voice_message = True
+        
+        if download_media:
+            if not await media_exists(cursor, entity_id, id, media_type):
+                try:
+                    media_dir = os.path.join(output_folder, "media", str(entity_id))
+                    os.makedirs(media_dir, exist_ok=True)
+                    media_file = await message.download_media(file=media_dir)
+                    if media_file:
+                        media_hash = get_file_hash(media_file)
+                except Exception as e:
+                    print(f"Error downloading media from message {id}: {e}")
+            else:
+                cursor.execute("SELECT media_file, media_hash FROM messages WHERE id = ? AND entity_id = ?", 
+                              (id, entity_id))
+                result = cursor.fetchone()
+                if result:
+                    media_file, media_hash = result
+    
+    forwarded = str(message.fwd_from) if message.fwd_from else None
+    from_id = str(message.from_id)
+    user_id = extract_user_id(from_id)
+    views = message.views
+    
+    sender_name = None
+    
+    if message.sender:
+        if hasattr(message.sender, 'first_name') and message.sender.first_name:
+            sender_name = message.sender.first_name
+            if hasattr(message.sender, 'last_name') and message.sender.last_name:
+                sender_name += f" {message.sender.last_name}"
+        elif hasattr(message.sender, 'title'):
+            sender_name = message.sender.title
+    
+    if not sender_name:
+        try:
+            channel_name = await get_channel_name_from_message(client, message)
+            if channel_name:
+                sender_name = channel_name
+            elif message.fwd_from:
+                if hasattr(message.fwd_from, 'from_name') and message.fwd_from.from_name:
+                    sender_name = message.fwd_from.from_name
+                elif message.fwd_from.channel_id:
+                    try:
+                        fwd_channel = await client.get_entity(message.fwd_from.channel_id)
+                        if hasattr(fwd_channel, 'title'):
+                            sender_name = f"{fwd_channel.title} (forwarded)"
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error determining message sender {id}: {e}")
+    
+    reply_to_msg_id = message.reply_to_msg_id if message.reply_to_msg_id else None
+    quote_text = None
+    
+    if hasattr(message, 'reply_to') and message.reply_to:
+        if hasattr(message.reply_to, 'quote_text'):
+            quote_text = message.reply_to.quote_text
+    
+    reactions_json = None
+    if hasattr(message, 'reactions') and message.reactions:
+        reactions_list = []
+        for reaction in message.reactions.results:
+            emoji = get_emoji_string(reaction.reaction)
+            count = reaction.count
+            reactions_list.append({"emoji": emoji, "count": count})
+            cursor.execute("INSERT OR IGNORE INTO reactions VALUES (?, ?, ?, ?)",
+                          (int(id), int(entity_id), str(emoji), int(count)))
+        reactions_json = json.dumps(reactions_list)
+    
+    cursor.execute("""
+    INSERT OR IGNORE INTO messages 
+    (id, entity_id, date, text, media_type, media_file, media_hash, forwarded, from_id, views, 
+    sender_name, reply_to_msg_id, reactions, web_preview, extraction_time, is_service_message,
+    is_voice_message, is_pinned, user_id) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (int(id), int(entity_id), date, text, media_type, media_file, media_hash, forwarded, from_id, 
+         views if views is not None else 0, sender_name, 
+         int(reply_to_msg_id) if reply_to_msg_id is not None else None, 
+         reactions_json, web_preview, extraction_time, is_service_message, is_voice_message, is_pinned, user_id))
+    
+    if reply_to_msg_id:
+        cursor.execute("INSERT OR IGNORE INTO replies VALUES (?, ?, ?, ?)",
+                      (int(id), int(entity_id), int(reply_to_msg_id), quote_text))
+    
+    if message.buttons:
+        for i, row in enumerate(message.buttons):
+            for j, button in enumerate(row):
+                cursor.execute("INSERT OR IGNORE INTO buttons VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (int(id), int(entity_id), int(i), int(j), str(button.text), 
+                                str(button.data) if button.data else None, 
+                                str(button.url) if button.url else None))
+    
+    if text and not is_service_message:
+        soup = BeautifulSoup(text, "html.parser")
+        for link in soup.find_all('a'):
+            cursor.execute("INSERT OR IGNORE INTO buttons VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (int(id), int(entity_id), 0, 0, str(link.text), None, str(link['href'])))
+    
+    return id
+
 async def process_entity(client, entity_id, entity_name, entity, limit=None, download_media=False):
     print(f"\nProcessing: {entity_name} (ID: {entity_id})")
     print(f"Checkpoint interval: {checkpoint_interval} messages")
@@ -702,196 +897,7 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
 
     try:
         async for message in client.iter_messages(entity, limit=limit):
-            message_dict = message.to_dict()
-            id = message_dict["id"]
-            date = message_dict["date"].isoformat()
-            text = message_dict.get("message", None)
-            media_type = None
-            media_file = None
-            media_hash = None
-            is_service_message = False
-            is_voice_message = False
-            is_pinned = message.pinned
-            
-            if hasattr(message, 'action') and message.action:
-                action_dict = message.action.to_dict()
-                action_type = action_dict["_"]
-                
-                if action_type == "MessageActionChatAddUser":
-                    user_ids = action_dict.get("users", [])
-                    user_names = []
-                    for user_id in user_ids:
-                        try:
-                            user = await client.get_entity(user_id)
-                            if hasattr(user, "first_name") and user.first_name:
-                                name = user.first_name
-                                if hasattr(user, "last_name") and user.last_name:
-                                    name += f" {user.last_name}"
-                            else:
-                                name = f"User {user_id}"
-                            user_names.append(name)
-                        except Exception as e:
-                            print(f"Error getting user {user_id}: {str(e)}")
-                            user_names.append(f"User {user_id}")
-                    text = f"<service>{', '.join(filter(None, user_names))} joined the group</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatDeleteUser":
-                    user_id = action_dict.get("user_id")
-                    try:
-                        user = await client.get_entity(user_id)
-                        if hasattr(user, "first_name") and user.first_name:
-                            name = user.first_name
-                            if hasattr(user, "last_name") and user.last_name:
-                                name += f" {user.last_name}"
-                        else:
-                            name = f"User {user_id}"
-                    except Exception as e:
-                        print(f"Error getting user {user_id}: {str(e)}")
-                        name = f"User {user_id}"
-                    text = f"<service>{name} left the group</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatJoinedByLink":
-                    try:
-                        if message.sender:
-                            user_name = message.sender.first_name
-                            if hasattr(message.sender, "last_name") and message.sender.last_name:
-                                user_name += f" {message.sender.last_name}"
-                        else:
-                            user_name = "Someone"
-                    except:
-                        user_name = "Someone"
-                    text = f"<service>{user_name} joined the group via invite link</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChannelCreate":
-                    title = action_dict.get("title", "this channel")
-                    text = f"<service>Channel {title} created</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatCreate":
-                    title = action_dict.get("title", "this group")
-                    text = f"<service>Group {title} created</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionGroupCall":
-                    if action_dict.get("duration"):
-                        text = f"<service>Group call ended</service>"
-                    else:
-                        text = f"<service>Group call started</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatEditTitle":
-                    title = action_dict.get("title", "")
-                    text = f"<service>Group name changed to: {title}</service>"
-                    is_service_message = True
-                else:
-                    text = f"<service>Service message: {action_type}</service>"
-                    is_service_message = True
-            
-            web_preview = await get_web_preview_data(message)
-            
-            if message.media:
-                media_type = message_dict["media"]["_"]
-                
-                if media_type == "MessageMediaDocument":
-                    if hasattr(message.media, "document") and hasattr(message.media.document, "attributes"):
-                        for attr in message.media.document.attributes:
-                            if hasattr(attr, "_") and attr._ == "DocumentAttributeAudio":
-                                if hasattr(attr, "voice") and attr.voice:
-                                    is_voice_message = True
-                
-                if download_media:
-                    if not await media_exists(cursor, entity_id, id, media_type):
-                        try:
-                            media_dir = os.path.join(output_folder, "media", str(entity_id))
-                            os.makedirs(media_dir, exist_ok=True)
-                            media_file = await message.download_media(file=media_dir)
-                            if media_file:
-                                media_hash = get_file_hash(media_file)
-                        except Exception as e:
-                            print(f"Error downloading media from message {id}: {e}")
-                    else:
-                        cursor.execute("SELECT media_file, media_hash FROM messages WHERE id = ? AND entity_id = ?", 
-                                      (id, entity_id))
-                        result = cursor.fetchone()
-                        if result:
-                            media_file, media_hash = result
-            
-            forwarded = str(message.fwd_from) if message.fwd_from else None
-            from_id = str(message.from_id)
-            user_id = extract_user_id(from_id)
-            views = message.views
-            
-            sender_name = None
-            
-            if message.sender:
-                if hasattr(message.sender, 'first_name') and message.sender.first_name:
-                    sender_name = message.sender.first_name
-                    if hasattr(message.sender, 'last_name') and message.sender.last_name:
-                        sender_name += f" {message.sender.last_name}"
-                elif hasattr(message.sender, 'title'):
-                    sender_name = message.sender.title
-            
-            if not sender_name:
-                try:
-                    channel_name = await get_channel_name_from_message(client, message)
-                    if channel_name:
-                        sender_name = channel_name
-                    elif message.fwd_from:
-                        if hasattr(message.fwd_from, 'from_name') and message.fwd_from.from_name:
-                            sender_name = message.fwd_from.from_name
-                        elif message.fwd_from.channel_id:
-                            try:
-                                fwd_channel = await client.get_entity(message.fwd_from.channel_id)
-                                if hasattr(fwd_channel, 'title'):
-                                    sender_name = f"{fwd_channel.title} (forwarded)"
-                            except:
-                                pass
-                except Exception as e:
-                    print(f"Error determining message sender {id}: {e}")
-            
-            reply_to_msg_id = message.reply_to_msg_id if message.reply_to_msg_id else None
-            quote_text = None
-            
-            if hasattr(message, 'reply_to') and message.reply_to:
-                if hasattr(message.reply_to, 'quote_text'):
-                    quote_text = message.reply_to.quote_text
-            
-            reactions_json = None
-            if hasattr(message, 'reactions') and message.reactions:
-                reactions_list = []
-                for reaction in message.reactions.results:
-                    emoji = get_emoji_string(reaction.reaction)
-                    count = reaction.count
-                    reactions_list.append({"emoji": emoji, "count": count})
-                    cursor.execute("INSERT OR IGNORE INTO reactions VALUES (?, ?, ?, ?)",
-                                  (int(id), int(entity_id), str(emoji), int(count)))
-                reactions_json = json.dumps(reactions_list)
-            
-            cursor.execute("""
-            INSERT OR IGNORE INTO messages 
-            (id, entity_id, date, text, media_type, media_file, media_hash, forwarded, from_id, views, 
-            sender_name, reply_to_msg_id, reactions, web_preview, extraction_time, is_service_message,
-            is_voice_message, is_pinned, user_id) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (int(id), int(entity_id), date, text, media_type, media_file, media_hash, forwarded, from_id, 
-                 views if views is not None else 0, sender_name, 
-                 int(reply_to_msg_id) if reply_to_msg_id is not None else None, 
-                 reactions_json, web_preview, extraction_time, is_service_message, is_voice_message, is_pinned, user_id))
-            
-            if reply_to_msg_id:
-                cursor.execute("INSERT OR IGNORE INTO replies VALUES (?, ?, ?, ?)",
-                              (int(id), int(entity_id), int(reply_to_msg_id), quote_text))
-            
-            if message.buttons:
-                for i, row in enumerate(message.buttons):
-                    for j, button in enumerate(row):
-                        cursor.execute("INSERT OR IGNORE INTO buttons VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                       (int(id), int(entity_id), int(i), int(j), str(button.text), 
-                                        str(button.data) if button.data else None, 
-                                        str(button.url) if button.url else None))
-            
-            if text and not is_service_message:
-                soup = BeautifulSoup(text, "html.parser")
-                for link in soup.find_all('a'):
-                    cursor.execute("INSERT OR IGNORE INTO buttons VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                   (int(id), int(entity_id), 0, 0, str(link.text), None, str(link['href'])))
+            id = await process_message(client, message, cursor, entity_id, extraction_time, download_media)
             
             conn.commit()
             
@@ -1007,200 +1013,24 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
     result = cursor.fetchone()
     last_msg_id = result[0] if result[0] is not None else 0
     
-    print(f"Last message in database: {last_msg_id}")
-    print("Retrieving more recent messages...")
+    cursor.execute("SELECT MIN(id) FROM messages WHERE entity_id = ?", (entity_id,))
+    result = cursor.fetchone()
+    first_msg_id = result[0] if result[0] is not None else 0
     
+    print(f"Database contains messages from ID {first_msg_id} to {last_msg_id}")
+    
+    # Phase 1: Check for newer messages
+    print("Phase 1: Checking for newer messages...")
     new_messages_count = 0
+    older_messages_count = 0
     
     try:
+        # Phase 1: Process newer messages
         async for message in client.iter_messages(entity):
             if message.id <= last_msg_id:
                 break  
                 
-            message_dict = message.to_dict()
-            id = message_dict["id"]
-            date = message_dict["date"].isoformat()
-            text = message_dict.get("message", None)
-            media_type = None
-            media_file = None
-            media_hash = None
-            is_service_message = False
-            is_voice_message = False
-            is_pinned = message.pinned
-            
-            if hasattr(message, 'action') and message.action:
-                action_dict = message.action.to_dict()
-                action_type = action_dict["_"]
-                
-                if action_type == "MessageActionChatAddUser":
-                    user_ids = action_dict.get("users", [])
-                    user_names = []
-                    for user_id in user_ids:
-                        try:
-                            user = await client.get_entity(user_id)
-                            if hasattr(user, "first_name") and user.first_name:
-                                name = user.first_name
-                                if hasattr(user, "last_name") and user.last_name:
-                                    name += f" {user.last_name}"
-                            else:
-                                name = f"User {user_id}"
-                            user_names.append(name)
-                        except Exception as e:
-                            print(f"Error getting user {user_id}: {str(e)}")
-                            user_names.append(f"User {user_id}")
-                    text = f"<service>{', '.join(filter(None, user_names))} joined the group</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatDeleteUser":
-                    user_id = action_dict.get("user_id")
-                    try:
-                        user = await client.get_entity(user_id)
-                        if hasattr(user, "first_name") and user.first_name:
-                            name = user.first_name
-                            if hasattr(user, "last_name") and user.last_name:
-                                name += f" {user.last_name}"
-                        else:
-                            name = f"User {user_id}"
-                    except Exception as e:
-                        print(f"Error getting user {user_id}: {str(e)}")
-                        name = f"User {user_id}"
-                    text = f"<service>{name} left the group</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatJoinedByLink":
-                    try:
-                        if message.sender:
-                            user_name = message.sender.first_name
-                            if hasattr(message.sender, "last_name") and message.sender.last_name:
-                                user_name += f" {message.sender.last_name}"
-                        else:
-                            user_name = "Someone"
-                    except:
-                        user_name = "Someone"
-                    text = f"<service>{user_name} joined the group via invite link</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChannelCreate":
-                    title = action_dict.get("title", "this channel")
-                    text = f"<service>Channel {title} created</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatCreate":
-                    title = action_dict.get("title", "this group")
-                    text = f"<service>Group {title} created</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionGroupCall":
-                    if action_dict.get("duration"):
-                        text = f"<service>Group call ended</service>"
-                    else:
-                        text = f"<service>Group call started</service>"
-                    is_service_message = True
-                elif action_type == "MessageActionChatEditTitle":
-                    title = action_dict.get("title", "")
-                    text = f"<service>Group name changed to: {title}</service>"
-                    is_service_message = True
-                else:
-                    text = f"<service>Service message: {action_type}</service>"
-                    is_service_message = True
-            
-            web_preview = await get_web_preview_data(message)
-            
-            if message.media:
-                media_type = message_dict["media"]["_"]
-                
-                if media_type == "MessageMediaDocument":
-                    if hasattr(message.media, "document") and hasattr(message.media.document, "attributes"):
-                        for attr in message.media.document.attributes:
-                            if hasattr(attr, "_") and attr._ == "DocumentAttributeAudio":
-                                if hasattr(attr, "voice") and attr.voice:
-                                    is_voice_message = True
-                
-                if download_media:
-                    if not await media_exists(cursor, entity_id, id, media_type):
-                        try:
-                            media_dir = os.path.join(output_folder, "media", str(entity_id))
-                            os.makedirs(media_dir, exist_ok=True)
-                            media_file = await message.download_media(file=media_dir)
-                            if media_file:
-                                media_hash = get_file_hash(media_file)
-                        except Exception as e:
-                            print(f"Error downloading media from message {id}: {e}")
-            
-            forwarded = str(message.fwd_from) if message.fwd_from else None
-            from_id = str(message.from_id)
-            user_id = extract_user_id(from_id)
-            views = message.views
-            
-            sender_name = None
-            
-            if message.sender:
-                if hasattr(message.sender, 'first_name') and message.sender.first_name:
-                    sender_name = message.sender.first_name
-                    if hasattr(message.sender, 'last_name') and message.sender.last_name:
-                        sender_name += f" {message.sender.last_name}"
-                elif hasattr(message.sender, 'title'):
-                    sender_name = message.sender.title
-            
-            if not sender_name:
-                try:
-                    channel_name = await get_channel_name_from_message(client, message)
-                    if channel_name:
-                        sender_name = channel_name
-                    elif message.fwd_from:
-                        if hasattr(message.fwd_from, 'from_name') and message.fwd_from.from_name:
-                            sender_name = message.fwd_from.from_name
-                        elif message.fwd_from.channel_id:
-                            try:
-                                fwd_channel = await client.get_entity(message.fwd_from.channel_id)
-                                if hasattr(fwd_channel, 'title'):
-                                    sender_name = f"{fwd_channel.title} (forwarded)"
-                            except:
-                                pass
-                except Exception as e:
-                    print(f"Error determining message sender {id}: {e}")
-            
-            reply_to_msg_id = message.reply_to_msg_id if message.reply_to_msg_id else None
-            quote_text = None
-            
-            if hasattr(message, 'reply_to') and message.reply_to:
-                if hasattr(message.reply_to, 'quote_text'):
-                    quote_text = message.reply_to.quote_text
-            
-            reactions_json = None
-            if hasattr(message, 'reactions') and message.reactions:
-                reactions_list = []
-                for reaction in message.reactions.results:
-                    emoji = get_emoji_string(reaction.reaction)
-                    count = reaction.count
-                    reactions_list.append({"emoji": emoji, "count": count})
-                    cursor.execute("INSERT OR IGNORE INTO reactions VALUES (?, ?, ?, ?)",
-                                  (int(id), int(entity_id), str(emoji), int(count)))
-                reactions_json = json.dumps(reactions_list)
-            
-            cursor.execute("""
-            INSERT OR IGNORE INTO messages 
-            (id, entity_id, date, text, media_type, media_file, media_hash, forwarded, from_id, views, 
-            sender_name, reply_to_msg_id, reactions, web_preview, extraction_time, is_service_message,
-            is_voice_message, is_pinned, user_id) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (int(id), int(entity_id), date, text, media_type, media_file, media_hash, forwarded, from_id, 
-                 views if views is not None else 0, sender_name, 
-                 int(reply_to_msg_id) if reply_to_msg_id is not None else None, 
-                 reactions_json, web_preview, extraction_time, is_service_message, is_voice_message, is_pinned, user_id))
-            
-            if reply_to_msg_id:
-                cursor.execute("INSERT OR REPLACE INTO replies VALUES (?, ?, ?, ?)",
-                              (int(id), int(entity_id), int(reply_to_msg_id), quote_text))
-            
-            if message.buttons:
-                for i, row in enumerate(message.buttons):
-                    for j, button in enumerate(row):
-                        cursor.execute("INSERT OR IGNORE INTO buttons VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                       (int(id), int(entity_id), int(i), int(j), str(button.text), 
-                                        str(button.data) if button.data else None, 
-                                        str(button.url) if button.url else None))
-            
-            if text and not is_service_message:
-                soup = BeautifulSoup(text, "html.parser")
-                for link in soup.find_all('a'):
-                    cursor.execute("INSERT OR IGNORE INTO buttons VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                   (int(id), int(entity_id), 0, 0, str(link.text), None, str(link['href'])))
+            id = await process_message(client, message, cursor, entity_id, extraction_time, download_media)
             
             conn.commit()
             new_messages_count += 1
@@ -1211,7 +1041,36 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
             
             print(f"Message {id} processed ({new_messages_count} new)", end='\r')
         
-        print(f"\nUpdate completed. {new_messages_count} new messages added to {entity_name}.")
+        print(f"\nPhase 1 completed. {new_messages_count} new messages added.")
+        
+        # Phase 2: Check for older message gaps
+        if first_msg_id > 1:  # Only if there might be older messages
+            print(f"Phase 2: Checking for older messages before ID {first_msg_id}...")
+            
+            async for message in client.iter_messages(entity, offset_id=first_msg_id, reverse=False):
+                if message.id >= first_msg_id:
+                    break  # We've reached messages we already have
+                    
+                id = await process_message(client, message, cursor, entity_id, extraction_time, download_media)
+                
+                conn.commit()
+                older_messages_count += 1
+                
+                # Create checkpoint every N messages
+                if older_messages_count % checkpoint_interval == 0:
+                    checkpoint_progress(working_db_path, final_db_path, new_messages_count + older_messages_count)
+                
+                print(f"Message {id} processed ({older_messages_count} older)", end='\r')
+            
+            if older_messages_count > 0:
+                print(f"\nPhase 2 completed. {older_messages_count} older messages added.")
+            else:
+                print(f"\nPhase 2 completed. No older messages found.")
+        else:
+            print("No older messages to check for.")
+        
+        total_added = new_messages_count + older_messages_count
+        print(f"\nUpdate completed. {total_added} total messages added to {entity_name} ({new_messages_count} newer + {older_messages_count} older).")
     except Exception as e:
         print(f"Error updating messages: {e}")
     finally:
