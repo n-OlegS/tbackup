@@ -31,6 +31,9 @@ output_folder = os.getenv('OUTPUT_FOLDER', 'telegram_backups')
 use_local_temp = os.getenv('USE_LOCAL_TEMP', 'false').lower() == 'true'
 local_temp_folder = os.getenv('LOCAL_TEMP_FOLDER', '/tmp/telegram_backups')
 
+# Checkpoint interval for periodic backups (default: 1000 messages)
+checkpoint_interval = int(os.getenv('CHECKPOINT_INTERVAL', '1000'))
+
 # Validate API credentials
 if not api_id or not api_hash:
     print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in your .env file")
@@ -39,6 +42,7 @@ if not api_id or not api_hash:
     print("TELEGRAM_API_ID=your_api_id")
     print("TELEGRAM_API_HASH=your_api_hash")
     print("OUTPUT_FOLDER=telegram_backups")
+    print("CHECKPOINT_INTERVAL=1000  # Optional: messages between checkpoints")
     exit(1)
 
 # Create output folder if it doesn't exist
@@ -288,6 +292,26 @@ def copy_to_final_location(temp_db_path, final_db_path):
         except:
             pass
         print("Database copied successfully.")
+
+def checkpoint_progress(temp_db_path, final_db_path, message_count):
+    """Create a checkpoint by copying temp database to final location."""
+    if use_local_temp and temp_db_path != final_db_path:
+        import shutil
+        try:
+            checkpoint_time = datetime.datetime.now().strftime("%H:%M:%S")
+            print(f"\n[{checkpoint_time}] Checkpoint: Saving progress after {message_count} messages...")
+            # Ensure final directory exists
+            os.makedirs(os.path.dirname(final_db_path), exist_ok=True)
+            # Copy but don't remove temp file (we're still working)
+            shutil.copy2(temp_db_path, final_db_path)
+            print(f"[{checkpoint_time}] ✓ Checkpoint saved. Progress preserved up to message {message_count}.")
+        except Exception as e:
+            print(f"\n[{checkpoint_time}] ✗ Checkpoint failed: {e}")
+            print("Continuing without checkpoint...")
+    else:
+        # If not using temp, still log the checkpoint for user awareness
+        checkpoint_time = datetime.datetime.now().strftime("%H:%M:%S")
+        print(f"\n[{checkpoint_time}] ✓ Progress checkpoint: {message_count} messages processed.")
 
 def extract_user_id(from_id_str):
     if not from_id_str:
@@ -601,6 +625,7 @@ async def get_channel_name_from_message(client, message):
 
 async def process_entity(client, entity_id, entity_name, entity, limit=None, download_media=False):
     print(f"\nProcessing: {entity_name} (ID: {entity_id})")
+    print(f"Checkpoint interval: {checkpoint_interval} messages")
     
     if isinstance(entity, ChannelForbidden):
         print(f"The entity {entity_name} (ID: {entity_id}) is not accessible. It may have been deleted or you lack permission to access it.")
@@ -672,6 +697,8 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
     )""")
     
     extraction_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    
+    message_count = 0
 
     try:
         async for message in client.iter_messages(entity, limit=limit):
@@ -868,7 +895,13 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
             
             conn.commit()
             
-            print(f"Message {id} processed", end='\r')
+            message_count += 1
+            
+            # Create checkpoint every N messages
+            if message_count % checkpoint_interval == 0:
+                checkpoint_progress(working_db_path, final_db_path, message_count)
+            
+            print(f"Message {id} processed ({message_count} total)", end='\r')
         
         print(f"\nAll messages from {entity_name} have been processed.")
     except errors.FloodWaitError as e:
@@ -885,6 +918,7 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
 
 async def update_entity(client, entity_id, entity_name, entity, download_media=False):
     print(f"\nUpdating: {entity_name} (ID: {entity_id})")
+    print(f"Checkpoint interval: {checkpoint_interval} messages")
     
     sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
     final_db_path = os.path.join(output_folder, f"{sanitized_name}.db")
@@ -1170,7 +1204,12 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
             
             conn.commit()
             new_messages_count += 1
-            print(f"Message {id} processed", end='\r')
+            
+            # Create checkpoint every N messages
+            if new_messages_count % checkpoint_interval == 0:
+                checkpoint_progress(working_db_path, final_db_path, new_messages_count)
+            
+            print(f"Message {id} processed ({new_messages_count} new)", end='\r')
         
         print(f"\nUpdate completed. {new_messages_count} new messages added to {entity_name}.")
     except Exception as e:
