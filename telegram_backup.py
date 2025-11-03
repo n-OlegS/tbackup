@@ -62,6 +62,49 @@ def get_file_hash(file_path):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
+async def get_db_connection(db_name, max_retries=3):
+    """Get a database connection with proper configuration and retry logic."""
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(db_name, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=memory")
+            conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+            return conn
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                print(f"Database is locked (attempt {attempt + 1}/{max_retries}). Waiting and retrying...")
+                await asyncio.sleep(5 * (attempt + 1))  # Exponential backoff
+                continue
+            else:
+                raise
+    
+    # This should never be reached, but just in case
+    raise sqlite3.OperationalError("Failed to connect to database after multiple attempts")
+
+def get_db_connection_sync(db_name, max_retries=3):
+    """Get a database connection with proper configuration and retry logic (synchronous version)."""
+    import time
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(db_name, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=memory")
+            conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+            return conn
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                print(f"Database is locked (attempt {attempt + 1}/{max_retries}). Waiting and retrying...")
+                time.sleep(5 * (attempt + 1))  # Exponential backoff
+                continue
+            else:
+                raise
+    
+    # This should never be reached, but just in case
+    raise sqlite3.OperationalError("Failed to connect to database after multiple attempts")
+
 def extract_user_id(from_id_str):
     if not from_id_str:
         return None
@@ -381,7 +424,9 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
 
     sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
     db_name = os.path.join(output_folder, f"{sanitized_name}.db")
-    conn = sqlite3.connect(db_name)
+    
+    # Get database connection with retry logic
+    conn = await get_db_connection(db_name)
     cursor = conn.cursor()
     
     cursor.execute("""
@@ -659,7 +704,8 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
         await process_entity(client, entity_id, entity_name, entity, download_media=download_media)
         return
     
-    conn = sqlite3.connect(db_name)
+    # Get database connection with retry logic
+    conn = await get_db_connection(db_name)
     cursor = conn.cursor()
     
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
@@ -933,7 +979,8 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
     generate_html(db_name, sanitized_name, entity_id)
 
 def generate_html(db_name, chat_name, entity_id=None):
-    conn = sqlite3.connect(db_name)
+    # Get database connection with retry logic
+    conn = get_db_connection_sync(db_name)
     cursor = conn.cursor()
     
     entity_filter = ""
