@@ -62,20 +62,57 @@ def get_file_hash(file_path):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-async def get_db_connection(db_name, max_retries=3):
+async def get_db_connection(db_name, max_retries=5):
     """Get a database connection with proper configuration and retry logic."""
+    # Try to clean up any orphaned connections first
+    try:
+        # Force unlock by opening and immediately closing
+        temp_conn = sqlite3.connect(db_name, timeout=1.0)
+        temp_conn.close()
+    except:
+        pass
+    
     for attempt in range(max_retries):
         try:
-            conn = sqlite3.connect(db_name, timeout=30.0)
-            conn.execute("PRAGMA journal_mode=WAL")
+            # First, try to remove WAL files if they exist and are causing issues
+            if attempt > 1:
+                wal_file = db_name + "-wal"
+                shm_file = db_name + "-shm"
+                try:
+                    if os.path.exists(wal_file):
+                        print(f"Removing WAL file: {wal_file}")
+                        os.remove(wal_file)
+                    if os.path.exists(shm_file):
+                        print(f"Removing SHM file: {shm_file}")
+                        os.remove(shm_file)
+                except:
+                    pass
+            
+            conn = sqlite3.connect(db_name, timeout=60.0)
+            
+            # Try to enable WAL mode, but fall back to DELETE mode if it fails
+            try:
+                result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                if result and result[0].upper() != 'WAL':
+                    print("WAL mode not available, using DELETE mode")
+                    conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.OperationalError:
+                print("Failed to set WAL mode, using default")
+                
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA temp_store=memory")
-            conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+            conn.execute("PRAGMA busy_timeout=60000")  # 60 second busy timeout
+            
+            # Test the connection
+            conn.execute("SELECT 1").fetchone()
+            
             return conn
+            
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e).lower() and attempt < max_retries - 1:
-                print(f"Database is locked (attempt {attempt + 1}/{max_retries}). Waiting and retrying...")
-                await asyncio.sleep(5 * (attempt + 1))  # Exponential backoff
+                wait_time = 10 * (attempt + 1)
+                print(f"Database is locked (attempt {attempt + 1}/{max_retries}). Waiting {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
                 continue
             else:
                 raise
@@ -83,27 +120,81 @@ async def get_db_connection(db_name, max_retries=3):
     # This should never be reached, but just in case
     raise sqlite3.OperationalError("Failed to connect to database after multiple attempts")
 
-def get_db_connection_sync(db_name, max_retries=3):
+def get_db_connection_sync(db_name, max_retries=5):
     """Get a database connection with proper configuration and retry logic (synchronous version)."""
     import time
+    
+    # Try to clean up any orphaned connections first
+    try:
+        # Force unlock by opening and immediately closing
+        temp_conn = sqlite3.connect(db_name, timeout=1.0)
+        temp_conn.close()
+    except:
+        pass
+    
     for attempt in range(max_retries):
         try:
-            conn = sqlite3.connect(db_name, timeout=30.0)
-            conn.execute("PRAGMA journal_mode=WAL")
+            # First, try to remove WAL files if they exist and are causing issues
+            if attempt > 1:
+                wal_file = db_name + "-wal"
+                shm_file = db_name + "-shm"
+                try:
+                    if os.path.exists(wal_file):
+                        print(f"Removing WAL file: {wal_file}")
+                        os.remove(wal_file)
+                    if os.path.exists(shm_file):
+                        print(f"Removing SHM file: {shm_file}")
+                        os.remove(shm_file)
+                except:
+                    pass
+            
+            conn = sqlite3.connect(db_name, timeout=60.0)
+            
+            # Try to enable WAL mode, but fall back to DELETE mode if it fails
+            try:
+                result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                if result and result[0].upper() != 'WAL':
+                    print("WAL mode not available, using DELETE mode")
+                    conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.OperationalError:
+                print("Failed to set WAL mode, using default")
+                
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA temp_store=memory")
-            conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+            conn.execute("PRAGMA busy_timeout=60000")  # 60 second busy timeout
+            
+            # Test the connection
+            conn.execute("SELECT 1").fetchone()
+            
             return conn
+            
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e).lower() and attempt < max_retries - 1:
-                print(f"Database is locked (attempt {attempt + 1}/{max_retries}). Waiting and retrying...")
-                time.sleep(5 * (attempt + 1))  # Exponential backoff
+                wait_time = 10 * (attempt + 1)
+                print(f"Database is locked (attempt {attempt + 1}/{max_retries}). Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
                 continue
             else:
                 raise
     
     # This should never be reached, but just in case
     raise sqlite3.OperationalError("Failed to connect to database after multiple attempts")
+
+def cleanup_database_files(db_name):
+    """Clean up SQLite auxiliary files that might be causing locks."""
+    files_to_clean = [
+        db_name + "-wal",
+        db_name + "-shm",
+        db_name + "-journal"
+    ]
+    
+    for file_path in files_to_clean:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"Cleaned up: {file_path}")
+            except Exception as e:
+                print(f"Could not remove {file_path}: {e}")
 
 def extract_user_id(from_id_str):
     if not from_id_str:
@@ -425,6 +516,9 @@ async def process_entity(client, entity_id, entity_name, entity, limit=None, dow
     sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
     db_name = os.path.join(output_folder, f"{sanitized_name}.db")
     
+    # Clean up any problematic auxiliary files first
+    cleanup_database_files(db_name)
+    
     # Get database connection with retry logic
     conn = await get_db_connection(db_name)
     cursor = conn.cursor()
@@ -704,6 +798,9 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
         await process_entity(client, entity_id, entity_name, entity, download_media=download_media)
         return
     
+    # Clean up any problematic auxiliary files first
+    cleanup_database_files(db_name)
+    
     # Get database connection with retry logic
     conn = await get_db_connection(db_name)
     cursor = conn.cursor()
@@ -979,6 +1076,9 @@ async def update_entity(client, entity_id, entity_name, entity, download_media=F
     generate_html(db_name, sanitized_name, entity_id)
 
 def generate_html(db_name, chat_name, entity_id=None):
+    # Clean up any problematic auxiliary files first
+    cleanup_database_files(db_name)
+    
     # Get database connection with retry logic
     conn = get_db_connection_sync(db_name)
     cursor = conn.cursor()
