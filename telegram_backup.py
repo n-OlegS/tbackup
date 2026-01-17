@@ -22,6 +22,7 @@ from telethon.tl.types import User, Channel, Chat, ChannelForbidden, MessageMedi
 from jinja2 import Environment, FileSystemLoader
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 from telethon.tl.functions.contacts import GetContactsRequest
+from telethon.tl.functions.auth import SendCodeRequest, SignInRequest
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
@@ -455,7 +456,22 @@ async def main():
     # Force connection to correct production DC
     client.session.set_dc(2, '149.154.167.50', 443)
 
-    await client.start(phone=phone_number, force_sms=True)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        print(f"Sending code request to {phone_number}...")
+        try:
+            result = await client(SendCodeRequest(phone_number, api_id, api_hash, None))
+            print(f"SendCodeRequest result: {result}")
+            print(f"Code type: {result.type}")
+            phone_code_hash = result.phone_code_hash
+
+            code = input("Enter the code you received: ")
+            await client(SignInRequest(phone_number, phone_code_hash, code))
+        except Exception as e:
+            print(f"Auth error: {type(e).__name__}: {e}")
+            raise
+
     me = await client.get_me()
     print(f"Session started as {me.first_name}")
     
