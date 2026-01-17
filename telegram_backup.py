@@ -8,8 +8,16 @@ import warnings
 import csv
 import hashlib
 import datetime
+import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
+
+# Enable verbose logging for Telethon
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG
+)
+logger = logging.getLogger(__name__)
 from telethon.tl.types import User, Channel, Chat, ChannelForbidden, MessageMediaWebPage
 from jinja2 import Environment, FileSystemLoader
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
