@@ -455,7 +455,7 @@ async def main():
     # Force connection to correct production DC
     client.session.set_dc(2, '149.154.167.50', 443)
 
-    await client.start(phone=phone_number)
+    await client.start(phone=phone_number, force_sms=True)
     me = await client.get_me()
     print(f"Session started as {me.first_name}")
     
