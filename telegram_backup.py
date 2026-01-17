@@ -454,10 +454,8 @@ async def main():
     phone_number = input("Enter your phone number: ")
     client = TelegramClient(phone_number, api_id, api_hash, receive_updates=False)
 
-    # Force connection to correct production DC
-    client.session.set_dc(2, '149.154.167.50', 443)
-
     await client.connect()
+    print(f"Connected to DC: {client.session.dc_id}")
 
     if not await client.is_user_authorized():
         print(f"Sending code request to {phone_number}...")
