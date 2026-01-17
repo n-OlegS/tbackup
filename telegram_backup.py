@@ -443,7 +443,10 @@ async def delete_telegram_service_messages(client):
 async def main():
     phone_number = input("Enter your phone number: ")
     client = TelegramClient(phone_number, api_id, api_hash, receive_updates=False)
-    
+
+    # Force connection to correct production DC
+    client.session.set_dc(2, '149.154.167.50', 443)
+
     await client.start(phone=phone_number)
     me = await client.get_me()
     print(f"Session started as {me.first_name}")
