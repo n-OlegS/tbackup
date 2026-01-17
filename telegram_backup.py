@@ -23,6 +23,7 @@ from jinja2 import Environment, FileSystemLoader
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.tl.functions.auth import SendCodeRequest, SignInRequest
+from telethon.tl.types import CodeSettings
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
@@ -461,7 +462,7 @@ async def main():
     if not await client.is_user_authorized():
         print(f"Sending code request to {phone_number}...")
         try:
-            result = await client(SendCodeRequest(phone_number, api_id, api_hash, None))
+            result = await client(SendCodeRequest(phone_number, api_id, api_hash, CodeSettings()))
             print(f"SendCodeRequest result: {result}")
             print(f"Code type: {result.type}")
             phone_code_hash = result.phone_code_hash
